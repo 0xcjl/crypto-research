@@ -10,18 +10,41 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from common import asset_key, ensure_runtime, instant, number
 from collect import collect, compact_data, configure_transport, fetch_one, import_native, prepare, public_url, resolve_source
-from ledger import audit, due, outcome, record_decision, record_review, summary
+from ledger import audit, due, outcome, record_decision, record_erratum, record_review, summary
 from metrics import candles, change, concentration, delta, depth
 from research import doctor
+import codex_step
+from install import verify as verify_manifest
 
 ASSET = {"chain": "ethereum", "native_id": "eth"}
 BTC = {"chain": "bitcoin", "native_id": "btc"}
 EVIDENCE = {"records": [{"evidence_id": "p1", "status": "ok", "url": "https://example.com/price"}]}
+RAW = str(Path(__file__).resolve())  # any existing file stands in for a raw capture in synthetic fixtures
+
+
+def source(**override):
+    value = {"evidence_ref": "p1", "source_url": "https://example.com/price", "observed_at": "2025-12-31T23:50:00Z",
+             "fetched_at": "2025-12-31T23:55:00Z", "raw_path": RAW}
+    value.update(override)
+    return value
 
 
 def quote(price=100, at="2026-01-01T00:00:00Z", asset=None):
     return {"asset": asset or ASSET, "price": price, "currency": "USD", "observed_at": at,
             "venue": "fixture", "instrument": "BTCUSD" if asset == BTC else "ETHUSD", "evidence_refs": ["p1"]}
+
+
+def safety(**states):
+    rows = []
+    for item in ("mint", "owner_privileges", "proxy_upgrade", "pause_blacklist", "tax", "sell_simulation", "lp_lock", "source_verified"):
+        state = states.get(item, "not_applicable")
+        row = {"item": item, "status": state}
+        if state in {"checked_none_found", "confirmed_risk"}:
+            row.update(evidence_refs=["p1"], method="fixture method")
+        else:
+            row["note"] = "fixture: native asset has no contract"
+        rows.append(row)
+    return rows
 
 
 def decision(signal="BUY"):
@@ -30,8 +53,13 @@ def decision(signal="BUY"):
             "signal": signal, "risk": "high", "thesis": "Fixture, not a real investment judgment",
             "signal_window": "1 week", "valid_until": "2026-01-08T00:00:00Z", "invalidation_conditions": ["fixture invalidation"],
             "recheck_conditions": ["Fixture event"], "evidence_refs": ["p1"], "reference_quote": quote(),
-            "assertions": [{"id": "event1", "condition": "Fixture event by horizon", "evidence_refs": ["p1"]}],
-            "benchmark": {"asset": BTC, "reference_quote": quote(100, asset=BTC)}}
+            "assertions": [{"id": "event1", "condition": "Fixture event by horizon", "check_by": "2026-01-31T00:00:00Z", "evidence_refs": ["p1"]}],
+            "safety_checks": safety(),
+            "benchmark": {"asset": BTC, "reference_quote": quote(100, asset=BTC)},
+            "data_cutoff": "2025-12-31T23:59:00Z", "analysis_completed_at": "2026-01-01T00:05:00Z",
+            "claims": [{"claim_id": "c1", "text": "Fixture claim", "label": "fact", "sources": [source()]}],
+            "review_objections": [{"id": "o1", "source": RAW, "objection": "Fixture objection",
+                                   "disposition": "retained", "retention_reason": "Fixture reason"}]}
 
 
 class MetricsTests(unittest.TestCase):
@@ -265,5 +293,281 @@ class LedgerTests(unittest.TestCase):
         with self.assertRaises(ValueError): outcome(original, review, EVIDENCE)
 
 
+class EvidenceGateTests(unittest.TestCase):
+    """0.1.3: claim-level provenance, separated times, and the review-objection release gate."""
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def test_missing_claim_fields_rejected(self):
+        for field in ("source_url", "observed_at", "fetched_at", "raw_path"):
+            value = decision()
+            del value["claims"][0]["sources"][0][field]
+            with self.assertRaisesRegex(ValueError, field): record_decision(value, EVIDENCE, self.root)
+        value = decision()
+        value["claims"][0]["sources"][0]["observed_at"] = None
+        with self.assertRaisesRegex(ValueError, "observed_at_unknown_reason"): record_decision(value, EVIDENCE, self.root)
+        value["claims"][0]["sources"][0]["observed_at_unknown_reason"] = "Source gives no data time"
+        record_decision(value, EVIDENCE, self.root)
+        value = decision()
+        value["decision_id"] = "raw-missing"
+        value["claims"][0]["sources"][0]["raw_path"] = str(self.root / "absent.json")
+        with self.assertRaisesRegex(ValueError, "raw_path"): record_decision(value, EVIDENCE, self.root)
+        value = decision()
+        del value["claims"]
+        with self.assertRaisesRegex(ValueError, "claims"): record_decision(value, EVIDENCE, self.root)
+        self.assertEqual(audit(self.root)["entries"], 1)
+
+    def test_cutoff_and_completion_are_separate_and_ordered(self):
+        for field in ("data_cutoff", "analysis_completed_at"):
+            value = decision()
+            del value[field]
+            with self.assertRaisesRegex(ValueError, field): record_decision(value, EVIDENCE, self.root)
+        value = decision()
+        value["claims"][0]["sources"][0]["fetched_at"] = "2026-01-01T00:03:00Z"  # fetched after cutoff/as_of
+        with self.assertRaisesRegex(ValueError, "data_cutoff"): record_decision(value, EVIDENCE, self.root)
+        value = decision()
+        value["analysis_completed_at"] = "2025-12-31T23:59:30Z"
+        with self.assertRaises(ValueError): record_decision(value, EVIDENCE, self.root)
+        evidence = {"records": [{**EVIDENCE["records"][0], "retrieved_at": "2025-12-31T23:00:00Z"}]}
+        with self.assertRaisesRegex(ValueError, "retrieved_at"): record_decision(decision(), evidence, self.root)
+        self.assertEqual(audit(self.root)["entries"], 0)
+
+    def test_unresolved_objection_blocks_record(self):
+        value = decision()
+        del value["review_objections"]
+        with self.assertRaisesRegex(ValueError, "review_objections"): record_decision(value, EVIDENCE, self.root)
+        value["review_objections"] = []
+        with self.assertRaisesRegex(ValueError, "none_reason"): record_decision(value, EVIDENCE, self.root)
+        value["review_objections"] = [{"id": "o1", "source": RAW, "objection": "LP lock is only inferred"},
+                                      {"id": "o2", "source": RAW, "objection": "x", "disposition": "adopted", "summary_change": "y"}]
+        with self.assertRaisesRegex(ValueError, "o1, o2"): record_decision(value, EVIDENCE, self.root)
+        self.assertEqual(audit(self.root)["entries"], 0)
+        value["review_objections"][0].update(disposition="adopted", summary_change="Downgraded to inference", ledger_change="Thesis says inferred")
+        value["review_objections"][1].update(ledger_change="Thesis updated")
+        record_decision(value, EVIDENCE, self.root)
+        self.assertEqual(audit(self.root)["entries"], 1)
+
+    def test_erratum_appends_without_touching_original(self):
+        original = record_decision(decision(), EVIDENCE, self.root)
+        errata_file = self.root / "errata.md"
+        errata_file.write_text("fixture")
+        item = {"erratum_id": "eth-20260101-e1", "target_decision_id": "eth-20260101", "authored_by": "executor",
+                "execution_agent": "fixture", "model": "unknown", "errata_path": str(errata_file),
+                "corrections": [{"id": "k1", "original_text": "a", "original_location": "report:1", "disposition": "corrected",
+                                 "corrected_text": "b", "sources": [source()]}]}
+        bad = copy.deepcopy(item)
+        del bad["corrections"][0]["sources"][0]["fetched_at"]
+        with self.assertRaisesRegex(ValueError, "fetched_at"): record_erratum(bad, self.root)
+        bad = copy.deepcopy(item)
+        bad["target_decision_id"] = "missing"
+        with self.assertRaises(ValueError): record_erratum(bad, self.root)
+        record_erratum(item, self.root)
+        with self.assertRaises(ValueError): record_erratum(item, self.root)
+        rows = [json.loads(line) for line in (self.root / "judgments.jsonl").read_text().splitlines()]
+        self.assertEqual(rows[0], original)
+        self.assertEqual(audit(self.root)["entries"], 2)
+        self.assertEqual(due(self.root, "2026-01-31T00:00:00Z")[0]["errata"], ["eth-20260101-e1"])
+        self.assertEqual(summary(self.root)["groups"]["30d_BUY"]["n"], 0)
+
+
+class V014Tests(unittest.TestCase):
+    """0.1.4: file:// sources, WATCH baseline tracking, four-state safety, manifest + codex step accounting."""
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def test_file_source_must_exist(self):
+        value = decision()
+        value["claims"][0]["sources"] = [source(source_url="file://" + RAW)]
+        record_decision(value, EVIDENCE, self.root)
+        value = decision(); value["decision_id"] = "eth-20260101-b"
+        value["claims"][0]["sources"] = [source(source_url="file:///nonexistent/x.json")]
+        with self.assertRaisesRegex(ValueError, "must exist"): record_decision(value, EVIDENCE, self.root)
+
+    def test_watch_requires_baseline_and_events_or_explicit_gap(self):
+        for field, gap in (("reference_quote", "baseline_gap"), ("assertions", "no_assertion_reason")):
+            value = decision("WATCH"); value.pop(field)
+            with self.assertRaisesRegex(ValueError, gap): record_decision(value, EVIDENCE, self.root)
+            value[gap] = "fixture: no tradable venue"
+            value["decision_id"] = f"eth-20260101-{field[:3]}"
+            record_decision(value, EVIDENCE, self.root)
+        value = decision("WATCH"); value["decision_id"] = "eth-20260101-w"; value["assertions"][0].pop("check_by")
+        with self.assertRaisesRegex(ValueError, "check_by"): record_decision(value, EVIDENCE, self.root)
+
+    def test_watch_review_is_evaluated_but_not_scored(self):
+        record_decision(decision("WATCH"), EVIDENCE, self.root)
+        review = {"decision_id": "eth-20260101", "horizon_days": 30, "authored_by": "model", "status": "complete",
+                  "assessment": "fixture", "execution_agent": "fixture", "model": "fixture-only",
+                  "reviewed_at": "2026-01-31T01:00:00Z", "quote": quote(90, "2026-01-31T00:00:00Z"),
+                  "benchmark_quote": quote(100, "2026-01-31T00:00:00Z", BTC),
+                  "assertion_results": [{"id": "event1", "status": "occurred", "evidence_refs": ["p1"]}]}
+        row = record_review(review, EVIDENCE, self.root)
+        self.assertEqual(row["outcome"]["price_status"], "evaluable")
+        self.assertAlmostEqual(row["outcome"]["return_pct"], -10)
+        self.assertIsNone(row["outcome"]["direction_hit"])
+        self.assertFalse(row["outcome"]["counts_toward_hit_rate"])
+        self.assertEqual(row["outcome"]["event_status"], "evaluable")
+        groups = summary(self.root)["groups"]
+        self.assertEqual(groups["WATCH_tracking"]["n_reviews"], 1)
+        self.assertEqual(groups["WATCH_tracking"]["events"]["occurred"], 1)
+        self.assertEqual(sum(groups[k]["n"] for k in groups if k != "WATCH_tracking"), 0)
+
+    def test_safety_four_states(self):
+        value = decision(); value.pop("safety_checks")
+        with self.assertRaisesRegex(ValueError, "safety_checks"): record_decision(value, EVIDENCE, self.root)
+        for bad in ({"status": "safe"}, {"status": "checked_none_found", "evidence_refs": [], "method": "x"},
+                    {"status": "unverified", "note": ""}):
+            value = decision(); value["safety_checks"][0] = {"item": "mint", **bad}
+            with self.assertRaises(ValueError): record_decision(value, EVIDENCE, self.root)
+        value = decision(); value["safety_checks"] = value["safety_checks"][1:]
+        with self.assertRaisesRegex(ValueError, "missing required items: mint"): record_decision(value, EVIDENCE, self.root)
+        value = decision(); value["safety_checks"] = safety(mint="confirmed_risk", tax="checked_none_found", sell_simulation="unverified")
+        record_decision(value, EVIDENCE, self.root)
+        self.assertEqual(audit(self.root)["entries"], 1)
+
+    def test_template_lists_all_safety_items_with_valid_states(self):
+        import re
+        from ledger import SAFETY_ITEMS, SAFETY_STATES
+        text = (Path(__file__).resolve().parents[1] / "references/templates.md").read_text(encoding="utf-8")
+        rows = re.findall(r'\{"item": "([a-z_]+)", "status": "([a-z_]+)"', text)
+        self.assertEqual({item for item, _ in rows}, set(SAFETY_ITEMS))
+        self.assertTrue(all(state in SAFETY_STATES for _, state in rows))
+
+    def test_supersedes_must_exist(self):
+        value = decision(); value["supersedes"] = "missing"
+        with self.assertRaisesRegex(ValueError, "supersedes"): record_decision(value, EVIDENCE, self.root)
+
+    def test_manifest_pins_models_md_and_doctor_checks_it(self):
+        package = Path(__file__).resolve().parents[1]
+        self.assertIn("references/models.md", verify_manifest(package))
+        self.assertEqual(doctor(False)["manifest"]["status"], "ok")
+        import shutil
+        copy_root = self.root / "pkg"
+        shutil.copytree(package, copy_root, ignore=shutil.ignore_patterns("__pycache__"))
+        (copy_root / "references/models.md").write_text("tampered", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "Checksum mismatch: references/models.md"): verify_manifest(copy_root)
+
+    def test_codex_step_has_no_bypass_and_parses_tokens(self):
+        cmd = codex_step.build_cmd(Path("/tmp/x"), "m", "medium", "prompt")
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", cmd)
+        self.assertIn("workspace-write", cmd)
+        self.assertNotIn("dangerously", (Path(__file__).resolve().parents[1] / "references/models.md").read_text())
+        lines = [json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10, "cached_input_tokens": 4, "output_tokens": 3, "reasoning_output_tokens": 1}}),
+                 "not json", json.dumps({"type": "turn.completed", "usage": {"input_tokens": 5, "output_tokens": 2}})]
+        usage = codex_step.parse_usage("\n".join(lines))
+        self.assertEqual((usage["input_tokens"], usage["output_tokens"], usage["total_tokens"]), (15, 5, 20))
+        self.assertEqual(codex_step.parse_usage("no usage here"), "unknown")
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class V015Tests(unittest.TestCase):
+    """0.1.5: append-only review-run log; request-time fetched_at with seconds, HTTP Date and time_precision."""
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def cli(self, *extra):
+        import subprocess
+        script = Path(__file__).resolve().parents[1] / "scripts" / "research.py"
+        done = subprocess.run([sys.executable, str(script), "review-log", "--runtime", str(self.root), *extra],
+                              capture_output=True, text=True, check=True)
+        return json.loads(done.stdout)
+
+    def lines(self):
+        return [json.loads(line) for line in (self.root / "review_runs.jsonl").read_text().splitlines()]
+
+    def test_review_log_writes_when_nothing_due(self):
+        result = self.cli("--agent", "fixture-agent")
+        rows = self.lines()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["run_outcome"], "none")
+        self.assertEqual(rows[0]["due_ids"], [])
+        self.assertEqual(rows[0]["model"], "unknown")
+        self.assertEqual(rows[0]["execution_agent"], "fixture-agent")
+        self.assertRegex(rows[0]["run_started_at"]["utc"], r"T\d{2}:\d{2}:\d{2}Z$")
+        self.assertTrue(rows[0]["run_finished_at"]["bangkok"].endswith("+07:00"))
+        self.assertIn(rows[0]["doctor_status"], {"local_ready", "degraded", "error"})
+        self.assertEqual(result["review_runs_path"], str(self.root / "review_runs.jsonl"))
+
+    def test_review_log_per_item_outcomes_and_append_only(self):
+        record_decision(decision(), EVIDENCE, self.root)
+        self.cli("--at", "2026-02-01T00:00:00Z", "--model", "fixture-model")
+        first = (self.root / "review_runs.jsonl").read_text()
+        self.cli("--at", "2026-02-01T00:00:00Z", "--outcome", "eth-20260101:30=reviewed", "--outcome", "nope:30=failed")
+        rows = self.lines()
+        self.assertTrue((self.root / "review_runs.jsonl").read_text().startswith(first))
+        self.assertEqual(rows[0]["due_ids"], ["eth-20260101:30"])
+        self.assertEqual(rows[0]["items"][0]["outcome"], "pending_data")
+        self.assertFalse(rows[0]["items"][0]["outcome_reported"])
+        self.assertEqual(rows[1]["items"][0]["outcome"], "reviewed")
+        self.assertEqual(rows[1]["run_outcome"], "reviewed")
+        self.assertTrue(any("not due" in e for e in rows[1]["errors"]))
+
+    def test_review_log_records_due_failure(self):
+        (self.root / "judgments.jsonl").write_text("{broken\n")
+        self.cli()
+        row = self.lines()[0]
+        self.assertEqual(row["run_outcome"], "failed")
+        self.assertTrue(any(e.startswith("due:") for e in row["errors"]))
+
+    def test_fetch_records_request_time_and_http_date(self):
+        def fake(url, headers=None, body=None, meta=None):
+            meta.update(fetched_at="2026-01-01T00:00:01Z", http_date="Thu, 01 Jan 2026 00:00:01 GMT")
+            return b'{"pairs": []}', "application/json"
+        with patch("collect.request", side_effect=fake):
+            row = fetch_one({"id": "a", "kind": "dex-search", "params": {"query": "ETH"}}, self.root)
+        self.assertEqual(row["fetched_at"], "2026-01-01T00:00:01Z")
+        self.assertEqual(row["http_date"], "Thu, 01 Jan 2026 00:00:01 GMT")
+        self.assertEqual(row["time_precision"], "second")
+        with patch("collect.request", return_value=(b'{"pairs": []}', "application/json")):
+            row = fetch_one({"id": "b", "kind": "dex-search", "params": {"query": "BTC"}}, self.root)
+        self.assertRegex(row["fetched_at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+        self.assertIsNone(row["http_date"])
+
+    def test_request_reads_date_header(self):
+        import collect as module
+
+        class Response:
+            headers = {"Content-Type": "application/json", "Date": "Thu, 01 Jan 2026 00:00:02 GMT"}
+            def read(self, n): return b"{}"
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        class Opener:
+            def open(self, req, timeout): return Response()
+        meta = {}
+        with patch("collect.public_url", side_effect=lambda u: u), patch("collect.urllib.request.build_opener", return_value=Opener()):
+            module.request("https://example.com/x", meta=meta)
+        self.assertEqual(meta["http_date"], "Thu, 01 Jan 2026 00:00:02 GMT")
+        self.assertRegex(meta["fetched_at"], r"T\d{2}:\d{2}:\d{2}Z$")
+
+    def test_native_precision_and_ledger_accepts_new_fetched_at(self):
+        rows = import_native({"records": [
+            {"evidence_id": "m", "url": "https://x.com/a/status/1", "retrieved_at": "2026-01-01T00:00Z", "content": "c"},
+            {"evidence_id": "s", "url": "https://x.com/a/status/2", "retrieved_at": "2026-01-01T00:00:05Z", "content": "c"},
+            {"evidence_id": "f", "url": "https://x.com/a/status/3", "retrieved_at": "2026-01-01T00:00:05Z", "content": "c",
+             "time_precision": "file_mtime"}]})
+        self.assertEqual([r["time_precision"] for r in rows], ["minute", "second", "file_mtime"])
+        with self.assertRaises(ValueError):
+            import_native({"records": [{"evidence_id": "z", "url": "https://x.com/a", "retrieved_at": "2026-01-01T00:00:05Z",
+                                        "content": "c", "time_precision": "hour"}]})
+        evidence = {"records": [{"evidence_id": "p1", "status": "ok", "url": "https://example.com/price",
+                                 "retrieved_at": "2025-12-31T23:55:00.400000Z", "fetched_at": "2025-12-31T23:55:00Z"}]}
+        record_decision(decision(), evidence, self.root)
+        bad = decision(); bad["decision_id"] = "eth-20260102"
+        bad["claims"][0]["sources"][0]["time_precision"] = "hour"
+        with self.assertRaises(ValueError):
+            record_decision(bad, evidence, self.root)

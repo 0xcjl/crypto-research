@@ -8,6 +8,7 @@ python3 "$SKILL_ROOT/scripts/research.py" collect --runtime "$RUNTIME" --run-id 
 python3 "$SKILL_ROOT/scripts/research.py" prepare --runtime "$RUNTIME" --run-id eth-20261028-a --native native-evidence.json
 python3 "$SKILL_ROOT/scripts/research.py" metrics --runtime "$RUNTIME" --input metrics-input.json
 python3 "$SKILL_ROOT/scripts/research.py" record --runtime "$RUNTIME" --input decision.json --evidence "$RUNTIME/runs/eth-20261028-a/evidence.json"
+python3 "$SKILL_ROOT/scripts/research.py" errata --runtime "$RUNTIME" --input erratum.json
 python3 "$SKILL_ROOT/scripts/research.py" due --runtime "$RUNTIME"
 python3 "$SKILL_ROOT/scripts/research.py" review --runtime "$RUNTIME" --input review.json --evidence review-evidence.json
 python3 "$SKILL_ROOT/scripts/research.py" stats --runtime "$RUNTIME"
@@ -89,3 +90,15 @@ python3 -m unittest discover -s "$SKILL_ROOT/tests" -v
 
 
 0.1.2链范围见chains.md；新增rpc方法eth_chainId。采集源`{"id":"sui-head","kind":"sui-checkpoint"}`执行固定只读GraphQL主网checkpoint查询；不接受任意mutation。平台代理如需采集Sui，须先核实并加入精确公共域名graphql.mainnet.sui.io；Robinhood同理核实rpc.mainnet.chain.robinhood.com，不添加通配符。
+
+## 0.1.5：例行复盘运行日志
+
+每日例行任务结束时（无到期项也要）运行：
+
+```sh
+python3 "$SKILL_ROOT/scripts/research.py" review-log --runtime "$RUNTIME" --agent "<执行Agent>" --model "<实际模型或省略=unknown>" --started-at "<例行开始时间ISO>" [--outcome <decision_id>:<horizon>=reviewed|pending_data|failed ...] [--error "<文本>" ...]
+```
+
+追加到 `$RUNTIME/review_runs.jsonl`，不改旧行。未给 outcome 的到期项记为 pending_data（outcome_reported=false）。
+
+采集记录（0.1.5 起）：`fetched_at` 为发起请求时的 UTC 秒级时间，`http_date` 为响应 Date 头（无则 null），`time_precision` 为 second/minute/file_mtime。

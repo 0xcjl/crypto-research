@@ -11,8 +11,10 @@ from pathlib import Path
 
 from common import VERSION, ensure_runtime, now, read_json, safe_id, write_json
 from collect import collect, configure_transport, import_native, prepare, request, transport_settings
-from ledger import audit, due, record_decision, record_review, summary
+from ledger import audit, due, record_decision, record_erratum, record_review, summary
 from metrics import calculate
+from install import verify as verify_manifest
+from review_log import append_entry, build_entry, parse_outcomes, parse_started
 
 
 def doctor(network: bool) -> dict:
@@ -23,6 +25,12 @@ def doctor(network: bool) -> dict:
                    ("COINGECKO_DEMO_API_KEY", "BRAVE_SEARCH_API_KEY")},
               "native_x": "Must test host x tools; subscription is not an API credential; no cookies read by scripts.",
               "transport": {"trusted_proxy_ip": proxy, "trusted_public_hosts": sorted(hosts)}, "network": {}}
+    try:
+        members = verify_manifest(Path(__file__).resolve().parents[1])
+        result["manifest"] = {"status": "ok", "members": len(members), "models_md_pinned": "references/models.md" in members}
+    except Exception as exc:
+        result["manifest"] = {"status": "failed", "reason": str(exc)}
+        result["status"] = "degraded"
     if network:
         for name, url in {"dexscreener": "https://api.dexscreener.com/latest/dex/search?q=ethereum",
                           "binance_public_data": "https://data-api.binance.vision/api/v3/time"}.items():
@@ -33,8 +41,34 @@ def doctor(network: bool) -> dict:
             except Exception as exc:
                 result["network"][name] = {"status": "unavailable", "error_type": type(exc).__name__,
                                          "reason": str(exc) if isinstance(exc, ValueError) else "Network/provider request failed", "checked_at": now()}
-        result["status"] = "network_ready" if all(row["status"] == "ok" for row in result["network"].values()) else "degraded"
+        result["status"] = "network_ready" if result["status"] != "degraded" and all(row["status"] == "ok" for row in result["network"].values()) else "degraded"
     return result
+
+
+def review_log(args) -> dict:
+    """Always appends a line, even if doctor or due fails; failures are recorded as errors."""
+    from datetime import datetime, timezone
+    started = parse_started(args.started_at) or datetime.now(timezone.utc)
+    errors = list(args.error)
+    root = ensure_runtime(args.runtime)
+    try:
+        configure_transport(root)
+        doctor_status = doctor(False)["status"]
+    except Exception as exc:
+        doctor_status, _ = "error", errors.append(f"doctor: {type(exc).__name__}: {exc}")
+    try:
+        outcomes = parse_outcomes(args.outcome)
+    except ValueError as exc:
+        outcomes, _ = {}, errors.append(str(exc))
+    try:
+        audit(root)
+        rows = due(root, args.at)
+    except Exception as exc:
+        rows, _ = None, errors.append(f"due: {type(exc).__name__}: {exc}")
+    entry = build_entry(started=started, finished=datetime.now(timezone.utc), doctor_status=doctor_status,
+                        due_items=rows, outcomes=outcomes, agent=args.agent, model=args.model, errors=errors)
+    path = append_entry(root, entry)
+    return {"review_runs_path": str(path), **entry}
 
 
 def main():
@@ -43,7 +77,7 @@ def main():
     p = sub.add_parser("doctor")
     p.add_argument("--network", action="store_true")
     p.add_argument("--runtime", help="Read this runtime's explicitly configured platform transport.json")
-    for name in ("collect", "prepare", "metrics", "record", "due", "review", "stats", "audit"):
+    for name in ("collect", "prepare", "metrics", "record", "errata", "due", "review", "stats", "audit"):
         p = sub.add_parser(name)
         p.add_argument("--runtime", required=True, help="Data directory outside installed skill")
         if name in {"collect", "prepare"}:
@@ -53,13 +87,25 @@ def main():
             p.add_argument("--plan", required=True)
         if name == "prepare":
             p.add_argument("--native", help="Actual captured host search/X evidence JSON")
-        if name in {"metrics", "record", "review"}:
+        if name in {"metrics", "record", "review", "errata"}:
             p.add_argument("--input", required=True)
         if name in {"record", "review"}:
             p.add_argument("--evidence", required=True)
         if name == "due":
             p.add_argument("--at", help="Audit/testing only; normal scheduled runs omit this")
+    p = sub.add_parser("review-log", help="Append one line per routine run to RUNTIME/review_runs.jsonl (append-only)")
+    p.add_argument("--runtime", required=True)
+    p.add_argument("--agent", help="Executing agent; unknown if omitted")
+    p.add_argument("--model", help="Model actually used; unknown if omitted")
+    p.add_argument("--started-at", help="ISO time the routine started; defaults to now")
+    p.add_argument("--outcome", action="append", default=[], help="<decision_id>:<horizon>=reviewed|pending_data|failed")
+    p.add_argument("--error", action="append", default=[])
+    p.add_argument("--at", help="Audit/testing only: evaluate due at this time")
     args = parser.parse_args()
+    if args.command == "review-log":
+        result = review_log(args)
+        print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
+        return
     if args.command == "doctor":
         if args.runtime:
             configure_transport(ensure_runtime(args.runtime))
@@ -96,6 +142,8 @@ def main():
             write_json(root / "calculations" / (Path(args.input).stem + "-" + now().replace(":", "") + ".json"), result, exclusive=True)
         elif args.command == "record":
             result = record_decision(read_json(args.input), read_json(args.evidence), root)
+        elif args.command == "errata":
+            result = record_erratum(read_json(args.input), root)
         elif args.command == "review":
             result = record_review(read_json(args.input), read_json(args.evidence), root)
         elif args.command == "due":

@@ -12,6 +12,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from html.parser import HTMLParser
+from datetime import datetime, timezone
 from pathlib import Path
 
 from common import VERSION, digest, instant, now, read_json, safe_id, write_json
@@ -79,7 +80,14 @@ class PublicRedirect(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def request(url: str, headers: dict | None = None, body: dict | None = None) -> tuple[bytes, str]:
+def request_time() -> str:
+    """UTC ISO 8601 with second precision, taken when the request is issued (0.1.5)."""
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def request(url: str, headers: dict | None = None, body: dict | None = None,
+            meta: dict | None = None) -> tuple[bytes, str]:
+    """meta (optional) receives fetched_at (request time, seconds) and http_date (response Date header or None)."""
     url = public_url(url)
     host = urllib.parse.urlsplit(url).hostname
     with _lock:
@@ -96,7 +104,11 @@ def request(url: str, headers: dict | None = None, body: dict | None = None) -> 
         opener = urllib.request.build_opener(PublicRedirect())
         for attempt in range(3):
             try:
+                if meta is not None:
+                    meta["fetched_at"] = request_time()
                 with opener.open(req, timeout=20) as response:
+                    if meta is not None:
+                        meta["http_date"] = response.headers.get("Date")
                     payload = response.read(MAX_BYTES + 1)
                     if len(payload) > MAX_BYTES:
                         raise ValueError("Response exceeds 5 MB")
@@ -215,8 +227,12 @@ def fetch_one(source: dict, runtime: Path) -> dict:
             age = (instant(now()) - instant(previous["retrieved_at"])).total_seconds()
             if 0 <= age < ttl:
                 return {**previous, "evidence_id": eid, "cache_hit": True}
-        payload, content_type = request(url, headers, body)
+        meta: dict = {}
+        started = request_time()
+        payload, content_type = request(url, headers, body, meta=meta)
         acquired = now()
+        record.update(fetched_at=meta.get("fetched_at") or started, http_date=meta.get("http_date"),
+                      time_precision="second")
         suffix = ".json" if "json" in content_type else ".txt"
         raw_path = runtime / "raw" / (identity + "-" + digest(payload.hex())[:12] + suffix)
         raw_path.parent.mkdir(parents=True, exist_ok=True)
@@ -266,6 +282,15 @@ def collect(plan: dict, runtime: Path) -> dict:
                      for r in records if r["status"] != "ok"]}
 
 
+TIME_PRECISIONS = {"second", "minute", "file_mtime"}
+
+
+def infer_precision(stamp: str) -> str:
+    """second if the clock part has seconds (HH:MM:SS), else minute. file_mtime must be declared explicitly."""
+    import re
+    return "second" if re.search(r"T\d{2}:\d{2}:\d{2}", stamp) else "minute"
+
+
 def import_native(document: dict) -> list[dict]:
     result = []
     for source in document.get("records", []):
@@ -273,6 +298,10 @@ def import_native(document: dict) -> list[dict]:
         if not source.get("url") or not source.get("retrieved_at") or not source.get("content"):
             raise ValueError("Native evidence requires URL, retrieved_at, and actual captured content")
         instant(source["retrieved_at"])
+        precision = source.get("time_precision") or infer_precision(source["retrieved_at"])
+        if precision not in TIME_PRECISIONS:
+            raise ValueError("time_precision must be second, minute or file_mtime")
+        source = {**source, "time_precision": precision}
         if source.get("observed_at"):
             instant(source["observed_at"])
         result.append({**source, "kind": "native", "status": "ok", "data": source["content"],
