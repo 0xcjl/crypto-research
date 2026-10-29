@@ -16,7 +16,7 @@
 ## 算术口径
 
 - 标的收益：(P_horizon/P_reference - 1)*100；基准收益相同公式；相对收益为两者之差，单位百分点。
-- BUY价格上涨方向命中，SELL价格下跌方向命中；持平不命中，WATCH/UNDETERMINED/NOT_APPLICABLE不进入方向命中分母。BUY相对收益为正、SELL为负记相对方向命中，分别统计。
+- BUY价格上涨方向命中，SELL价格下跌方向命中；持平不命中，WATCH/UNDETERMINED/NOT_APPLICABLE不进入方向命中分母。WATCH 仍按基线计算价格变化并检验事件，结果单列在 stats 的 WATCH_tracking（counts_toward_hit_rate=false）。BUY相对收益为正、SELL为负记相对方向命中，分别统计。
 - 30/90天、BUY/SELL各列样本数、命中、方向命中率、相对样本与命中、不可评估数量及独立资产数。重复同一资产判断相关，不把快照样本当独立交易。
 - 风险/事件主张分别用occurred/not_occurred/unknown，并附对应证据；无法观察不能记预测失败或成功。不给风险等级算未经定义的统一胜率。
 - 基准端点需与标的端点相差不超过1h，基线与报告相差不超过15min。原信号的报价需报告前15min内；时间/来源无法保证时不计入准确率。

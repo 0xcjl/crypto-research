@@ -2,6 +2,8 @@
 
 每条证据有 evidence_id、kind、URL、observed_at（来源或采样观测时间）、retrieved_at（取得时间）、状态、raw_path、数据和哈希。来源未给数据时点则observed_at为null；接口返回当下快照可注明采样时间，但不能宣称来源内部更新延迟已知。帖子发布时间不是采集时间。
 
+结论级证据（0.1.3）：报告摘要中的每条实质结论在判断JSON的claims[]里登记，逐来源记录source_url、observed_at（数据本身时间；未知则null并写observed_at_unknown_reason）、fetched_at（抓取时间，与证据包retrieved_at一致）、raw_path（存在的原始文件）。判断另记data_cutoff（所用数据最晚取得时间）与analysis_completed_at（判断完成时间），二者不能合并成一个as_of。旧材料缺失的时间写legacy/unknown，不补造。
+
 采集状态 ok/error/unavailable 与数值null/0分开。旧缓存保留原取得时间；动态数据默认不缓存复用（cache_ttl=0），静态资料可指定不超过86400秒。公开源免费不代表稳定；失败记缺口，不用摘要补造精确数字。
 
 事实来源按问题选：官方/链浏览器确认资产，项目文档及实际产品确认功能，治理/链上执行核验机制，市场原始接口核验行情，原帖核验言论。模型识别同源转载、宣传、利益关系和反证；单一来源明确归属。每条报告结论引用证据ID/URL、数据时间；推断注明依据与不确定性。

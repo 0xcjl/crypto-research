@@ -7,6 +7,10 @@ import shutil
 from pathlib import Path, PurePosixPath
 
 
+REQUIRED_MEMBERS = ("SKILL.md", "scripts/research.py", "references/models.md", "VERSION")
+FORBIDDEN_FLAGS = ("--dangerously-bypass-approvals-and-sandbox",)
+
+
 def verify(root: Path) -> list[str]:
     manifest = root / "SHA256SUMS"
     names = []
@@ -21,7 +25,10 @@ def verify(root: Path) -> list[str]:
         if hashlib.sha256(actual.read_bytes()).hexdigest() != checksum:
             raise ValueError(f"Checksum mismatch: {name}")
         names.append(name)
-    if not names or "SKILL.md" not in names or "scripts/research.py" not in names:
+    models = root / "references/models.md"
+    if models.is_file() and any(flag in models.read_text(encoding="utf-8") for flag in FORBIDDEN_FLAGS):
+        raise ValueError("references/models.md must not contain an approval/sandbox bypass flag")
+    if not names or any(required not in names for required in REQUIRED_MEMBERS):
         raise ValueError("Incomplete package manifest")
     return names
 

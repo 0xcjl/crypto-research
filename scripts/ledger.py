@@ -4,13 +4,15 @@ from __future__ import annotations
 import json
 import os
 from contextlib import contextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from common import VERSION, asset_key, digest, instant, now, number, safe_id
 from metrics import change
 
 SIGNALS = {"BUY", "SELL", "WATCH", "UNDETERMINED", "NOT_APPLICABLE"}
+CLAIM_LABELS = {"fact", "inference", "self_reported", "third_party_estimate", "calculation", "unknown"}
+CLOCK_SKEW = timedelta(minutes=5)
 
 
 def entries(runtime: Path) -> list[dict]:
@@ -76,6 +78,141 @@ def check_quote(quote: dict, asset: dict, evidence: dict):
         raise ValueError("Quote venue/instrument required")
 
 
+def check_source(item: dict, where: str, evidence: dict | None = None) -> datetime:
+    """Conclusion-level provenance: link, data time, fetch time and raw file location are all mandatory."""
+    for key in ("source_url", "observed_at", "fetched_at", "raw_path"):
+        if key not in item:
+            raise ValueError(f"{where}: missing required evidence field {key}")
+    url = str(item["source_url"])
+    if not url.startswith(("https://", "http://", "file:///")):
+        raise ValueError(f"{where}: source_url must be a full http(s) link, or file:/// for local-only evidence")
+    if url.startswith("file:///") and not Path(url[7:]).exists():
+        raise ValueError(f"{where}: file:/// source_url must exist")
+    fetched = instant(item["fetched_at"])
+    if item["observed_at"] is None:
+        if not item.get("observed_at_unknown_reason"):
+            raise ValueError(f"{where}: observed_at=null requires observed_at_unknown_reason")
+    elif instant(item["observed_at"]) > fetched + CLOCK_SKEW:
+        raise ValueError(f"{where}: observed_at cannot be after fetched_at")
+    if not item["raw_path"] or not Path(item["raw_path"]).is_file():
+        raise ValueError(f"{where}: raw_path must point to an existing raw file")
+    if evidence is not None:
+        record = next((r for r in evidence["records"] if r["evidence_id"] == item.get("evidence_ref") and r["status"] == "ok"), None)
+        if record is None:
+            raise ValueError(f"{where}: evidence_ref must name a successful evidence record")
+        stamps = [instant(record[k]) for k in ("retrieved_at", "fetched_at") if record.get(k)]
+        if stamps and fetched not in stamps:
+            raise ValueError(f"{where}: fetched_at differs from evidence retrieved_at/fetched_at")
+    if item.get("time_precision") is not None and item["time_precision"] not in {"second", "minute", "file_mtime"}:
+        raise ValueError(f"{where}: time_precision must be second, minute or file_mtime")
+    return fetched
+
+
+SAFETY_ITEMS = ("mint", "owner_privileges", "proxy_upgrade", "pause_blacklist", "tax", "sell_simulation", "lp_lock", "source_verified")
+SAFETY_STATES = {"checked_none_found", "confirmed_risk", "unverified", "not_applicable"}
+
+
+def check_safety(value: dict, evidence: dict) -> None:
+    """0.1.4: every safety item gets one of four explicit states; no blanket 'safe' allowed."""
+    if not value.get("asset"):
+        return
+    checks = value.get("safety_checks")
+    if not isinstance(checks, list):
+        raise ValueError("safety_checks[] required (states: checked_none_found/confirmed_risk/unverified/not_applicable)")
+    seen = {}
+    for check in checks:
+        item, state = check.get("item"), check.get("status")
+        if not item or item in seen:
+            raise ValueError(f"safety_checks: missing or duplicate item {item}")
+        if state not in SAFETY_STATES:
+            raise ValueError(f"safety_checks {item}: status must be one of {sorted(SAFETY_STATES)}")
+        if state in {"checked_none_found", "confirmed_risk"}:
+            if not check.get("evidence_refs") or not check.get("method"):
+                raise ValueError(f"safety_checks {item}: {state} needs evidence_refs and method (what exactly was checked)")
+            check_refs(check["evidence_refs"], evidence)
+        elif not check.get("note"):
+            raise ValueError(f"safety_checks {item}: {state} needs a note (why unverified / not applicable)")
+        seen[item] = state
+    missing = [item for item in SAFETY_ITEMS if item not in seen]
+    if missing:
+        raise ValueError(f"safety_checks missing required items: {', '.join(missing)} (use not_applicable with note)")
+
+
+def check_watch(value: dict, at: datetime) -> None:
+    """0.1.4: WATCH records a price baseline and verifiable events by default; gaps must be explicit."""
+    if value["signal"] != "WATCH":
+        return
+    if not value.get("reference_quote") and not value.get("baseline_gap"):
+        raise ValueError("WATCH needs reference_quote (price baseline) or an explicit baseline_gap")
+    if not value.get("assertions") and not value.get("no_assertion_reason"):
+        raise ValueError("WATCH needs verifiable assertions (events) or an explicit no_assertion_reason")
+    if not value.get("signal_window") or not value.get("valid_until"):
+        raise ValueError("WATCH needs signal_window and valid_until")
+    if instant(value["valid_until"]) <= at:
+        raise ValueError("Signal validity must end after decision time")
+
+
+def check_claims(value: dict, evidence: dict) -> datetime:
+    claims = value.get("claims")
+    if not isinstance(claims, list) or not claims:
+        raise ValueError("claims[] required: every conclusion needs claim-level sources and times")
+    ids, latest = set(), None
+    for claim in claims:
+        safe_id(claim.get("claim_id", ""))
+        if claim["claim_id"] in ids:
+            raise ValueError("Claim IDs must be unique")
+        ids.add(claim["claim_id"])
+        if not claim.get("text") or claim.get("label") not in CLAIM_LABELS:
+            raise ValueError(f"claim {claim['claim_id']}: text and label in {sorted(CLAIM_LABELS)} required")
+        if not claim.get("sources"):
+            raise ValueError(f"claim {claim['claim_id']}: at least one source required")
+        for index, source in enumerate(claim["sources"]):
+            fetched = check_source(source, f"claim {claim['claim_id']} source {index}", evidence)
+            latest = fetched if latest is None or fetched > latest else latest
+    return latest
+
+
+def check_times(value: dict, latest_fetch: datetime, at: datetime):
+    for key in ("data_cutoff", "analysis_completed_at"):
+        if not value.get(key):
+            raise ValueError(f"{key} required; data cutoff and judgment completion are recorded separately")
+    cutoff, completed = instant(value["data_cutoff"]), instant(value["analysis_completed_at"])
+    if latest_fetch > cutoff:
+        raise ValueError("A cited source was fetched after data_cutoff")
+    if not cutoff <= at <= completed:
+        raise ValueError("Require data_cutoff <= as_of <= analysis_completed_at")
+    if completed > instant(now()) + CLOCK_SKEW:
+        raise ValueError("analysis_completed_at is in the future")
+
+
+def check_objections(value: dict):
+    """Release gate: every objection raised by terra/sol review must be adopted or explicitly retained."""
+    if "review_objections" not in value:
+        raise ValueError("review_objections required (empty list only with review_objections_none_reason)")
+    objections = value["review_objections"]
+    if not isinstance(objections, list):
+        raise ValueError("review_objections must be a list")
+    if not objections and not value.get("review_objections_none_reason"):
+        raise ValueError("Empty review_objections requires review_objections_none_reason")
+    ids, unresolved = set(), []
+    for item in objections:
+        safe_id(item.get("id", ""))
+        if item["id"] in ids:
+            raise ValueError("Objection IDs must be unique")
+        ids.add(item["id"])
+        if not item.get("objection") or not item.get("source") or not Path(item["source"]).is_file():
+            raise ValueError(f"objection {item['id']}: objection text and existing review output source required")
+        disposition = item.get("disposition")
+        if disposition == "adopted" and item.get("summary_change") and item.get("ledger_change"):
+            continue
+        if disposition == "retained" and item.get("retention_reason"):
+            continue
+        unresolved.append(item["id"])
+    if unresolved:
+        raise ValueError("Unresolved review objections (adopt with summary_change+ledger_change, or retain with retention_reason): "
+                         + ", ".join(unresolved))
+
+
 def record_decision(document: dict, evidence: dict, runtime: Path) -> dict:
     value = dict(document)
     safe_id(value["decision_id"])
@@ -87,6 +224,10 @@ def record_decision(document: dict, evidence: dict, runtime: Path) -> dict:
     if at > instant(now()) + timedelta(minutes=5):
         raise ValueError("Decision timestamp is in the future")
     check_refs(value["evidence_refs"], evidence)
+    check_objections(value)
+    check_times(value, check_claims(value, evidence), at)
+    check_safety(value, evidence)
+    check_watch(value, at)
     if not value.get("thesis") or not value.get("recheck_conditions") or not value.get("execution_agent") or not value.get("model"):
         raise ValueError("Thesis, recheck conditions and executing agent required")
     if value.get("asset"):
@@ -113,8 +254,8 @@ def record_decision(document: dict, evidence: dict, runtime: Path) -> dict:
             raise ValueError("Benchmark baseline must align within 15 min")
     for assertion in value.get("assertions", []):
         safe_id(assertion["id"])
-        if not assertion.get("condition"):
-            raise ValueError("Falsifiable assertion condition required")
+        if not assertion.get("condition") or not assertion.get("check_by"):
+            raise ValueError("Falsifiable assertion needs condition and check_by (deadline/horizon)")
         check_refs(assertion["evidence_refs"], evidence)
     assertion_ids = [item["id"] for item in value.get("assertions", [])]
     if len(assertion_ids) != len(set(assertion_ids)):
@@ -123,16 +264,23 @@ def record_decision(document: dict, evidence: dict, runtime: Path) -> dict:
                  due_at={str(day): (at + timedelta(days=day)).isoformat().replace("+00:00", "Z") for day in (30, 90)})
     with locked(runtime):
         audit(runtime)
-        if any(row.get("decision_id") == value["decision_id"] and row["record_type"] == "decision" for row in entries(runtime)):
+        rows = entries(runtime)
+        if any(row.get("decision_id") == value["decision_id"] and row["record_type"] == "decision" for row in rows):
             raise ValueError("Decision already exists; append a new ID with supersedes instead")
+        if value.get("supersedes") and not any(row["record_type"] == "decision" and row["decision_id"] == value["supersedes"] for row in rows):
+            raise ValueError("supersedes must name an existing decision")
         return append(runtime, value)
 
 
 def due(runtime: Path, at: str | None = None) -> list[dict]:
     rows, current = entries(runtime), instant(at or now())
     complete = {(r["decision_id"], r["horizon_days"]) for r in rows if r["record_type"] == "review" and r["status"] == "complete"}
+    errata = {}
+    for r in rows:
+        if r["record_type"] == "erratum":
+            errata.setdefault(r["target_decision_id"], []).append(r["erratum_id"])
     return [{"decision_id": row["decision_id"], "horizon_days": day, "due_at": timestamp,
-             "decision": row} for row in rows if row["record_type"] == "decision"
+             "decision": row, "errata": errata.get(row["decision_id"], [])} for row in rows if row["record_type"] == "decision"
             for horizon, timestamp in row["due_at"].items()
             if (day := int(horizon)) and instant(timestamp) <= current and (row["decision_id"], day) not in complete]
 
@@ -160,6 +308,7 @@ def outcome(decision: dict, review: dict, evidence: dict) -> dict:
         result["price_status"] = "evaluable"
         if decision["signal"] in {"BUY", "SELL"}:
             result["direction_hit"] = result["return_pct"] > 0 if decision["signal"] == "BUY" else result["return_pct"] < 0
+    result["counts_toward_hit_rate"] = decision["signal"] in {"BUY", "SELL"}
     benchmark, endpoint = decision.get("benchmark"), review.get("benchmark_quote")
     if benchmark and endpoint and result["return_pct"] is not None:
         check_quote(endpoint, benchmark["asset"], evidence)
@@ -213,7 +362,45 @@ def record_review(document: dict, evidence: dict, runtime: Path) -> dict:
                             or (decision.get("benchmark") and arithmetic["relative_status"] != "evaluable"))
         if missing_expected and value["status"] == "complete" and not value.get("final_data_unavailable_reason"):
             raise ValueError("Incomplete review must stay pending_data, or explicitly justify permanent data unavailability")
+        results = value.get("assertion_results", [])
+        arithmetic["event_status"] = ("not_applicable" if not assertions else
+                                      "evaluable" if any(r["status"] != "unknown" for r in results) else "not_evaluable")
+        arithmetic["events"] = {state: sum(r["status"] == state for r in results) for state in ("occurred", "not_occurred", "unknown")}
         return append(runtime, {**value, "record_type": "review", "outcome": arithmetic})
+
+
+def record_erratum(document: dict, runtime: Path) -> dict:
+    """Append-only correction of an earlier decision; the original record and report are never edited."""
+    value = dict(document)
+    safe_id(value["erratum_id"])
+    if not value.get("execution_agent") or not value.get("model") or not value.get("authored_by"):
+        raise ValueError("Erratum requires authored_by, execution_agent and model (unknown allowed)")
+    if not value.get("errata_path") or not Path(value["errata_path"]).is_file():
+        raise ValueError("errata_path must point to the saved errata document")
+    if not value.get("corrections"):
+        raise ValueError("Erratum needs at least one correction")
+    for item in value["corrections"]:
+        safe_id(item.get("id", ""))
+        if not item.get("original_text") or not item.get("original_location"):
+            raise ValueError(f"correction {item['id']}: original_text and original_location required")
+        if item.get("disposition") == "corrected" and not item.get("corrected_text"):
+            raise ValueError(f"correction {item['id']}: corrected_text required")
+        if item.get("disposition") == "retained" and not item.get("retention_reason"):
+            raise ValueError(f"correction {item['id']}: retention_reason required")
+        if item.get("disposition") not in {"corrected", "retained"}:
+            raise ValueError(f"correction {item['id']}: disposition must be corrected or retained")
+        if not item.get("sources"):
+            raise ValueError(f"correction {item['id']}: sources required")
+        for index, source in enumerate(item["sources"]):
+            check_source(source, f"correction {item['id']} source {index}")
+    with locked(runtime):
+        audit(runtime)
+        rows = entries(runtime)
+        if not any(r["record_type"] == "decision" and r["decision_id"] == value["target_decision_id"] for r in rows):
+            raise ValueError("Erratum target decision does not exist")
+        if any(r["record_type"] == "erratum" and r["erratum_id"] == value["erratum_id"] for r in rows):
+            raise ValueError("Erratum already exists")
+        return append(runtime, {**value, "record_type": "erratum", "skill_version": VERSION})
 
 
 def summary(runtime: Path) -> dict:
@@ -232,4 +419,10 @@ def summary(runtime: Path) -> dict:
                 "relative_not_evaluable": sum(r["outcome"]["relative_status"] == "not_evaluable" for r in eligible),
                 "unique_assets": len({decisions[r["decision_id"]].get("asset_key") for r in valid}),
                 "not_evaluable": len(eligible) - len(valid)}
+    watch = [r for r in rows if r["record_type"] == "review" and r["status"] == "complete" and decisions[r["decision_id"]]["signal"] == "WATCH"]
+    groups["WATCH_tracking"] = {"n_reviews": len(watch),
+        "price_evaluable": sum(r["outcome"].get("price_status") == "evaluable" for r in watch),
+        "returns_pct": [r["outcome"]["return_pct"] for r in watch if r["outcome"].get("return_pct") is not None],
+        "events": {state: sum(r["outcome"].get("events", {}).get(state, 0) for r in watch) for state in ("occurred", "not_occurred", "unknown")},
+        "counts_toward_hit_rate": False}
     return {"groups": groups, "note": "Observational signal snapshots, not realized trades; excludes WATCH/unknown. Repeated signals on the same asset are correlated; report unique assets."}
