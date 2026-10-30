@@ -15,6 +15,7 @@ from ledger import audit, due, record_decision, record_erratum, record_review, s
 from metrics import calculate
 from install import verify as verify_manifest
 from review_log import append_entry, build_entry, parse_outcomes, parse_started
+from factcheck import finalize as finalize_factcheck, skeleton as factcheck_skeleton, validate as validate_factcheck
 
 
 def doctor(network: bool) -> dict:
@@ -101,7 +102,35 @@ def main():
     p.add_argument("--outcome", action="append", default=[], help="<decision_id>:<horizon>=reviewed|pending_data|failed")
     p.add_argument("--error", action="append", default=[])
     p.add_argument("--at", help="Audit/testing only: evaluate due at this time")
+    p = sub.add_parser("factcheck", help="Quick fact-check (0.1.6): no signals, no ledger, no reviews")
+    fsub = p.add_subparsers(dest="action", required=True)
+    f = fsub.add_parser("new", help="Print (or write) a skeleton record for one claim; touches no runtime")
+    f.add_argument("--claim", required=True)
+    f.add_argument("--requested-by", choices=("user", "bot"), default="user")
+    f.add_argument("--requester-name")
+    f.add_argument("--id")
+    f.add_argument("--supersedes")
+    f.add_argument("--output", help="Write skeleton to this new file (never overwrites)")
+    f = fsub.add_parser("validate", help="Check a filled record; exit 2 on errors")
+    f.add_argument("--input", required=True)
+    f = fsub.add_parser("finalize", help="Validate and save append-only to RUNTIME/factchecks/<id>.json")
+    f.add_argument("--runtime", required=True)
+    f.add_argument("--input", required=True)
     args = parser.parse_args()
+    if args.command == "factcheck":
+        if args.action == "new":
+            result = factcheck_skeleton(args.claim, args.requested_by, args.requester_name, args.id, args.supersedes)
+            if args.output:
+                write_json(args.output, result, exclusive=True)
+        elif args.action == "validate":
+            result = validate_factcheck(read_json(args.input))
+            result["status"] = "ok" if not result["errors"] else "invalid"
+        else:
+            result = finalize_factcheck(read_json(args.input), ensure_runtime(args.runtime))
+        print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
+        if result.get("status") == "invalid":
+            sys.exit(2)
+        return
     if args.command == "review-log":
         result = review_log(args)
         print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))

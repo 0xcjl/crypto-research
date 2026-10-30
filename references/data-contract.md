@@ -8,6 +8,10 @@
 
 事实来源按问题选：官方/链浏览器确认资产，项目文档及实际产品确认功能，治理/链上执行核验机制，市场原始接口核验行情，原帖核验言论。模型识别同源转载、宣传、利益关系和反证；单一来源明确归属。每条报告结论引用证据ID/URL、数据时间；推断注明依据与不确定性。
 
+## 不用训练记忆当事实（0.1.6）
+
+事实陈述只能引用本次运行抓取、带 fetched_at（请求时刻，UTC 秒）的证据。模型记忆只能用于假设和搜索词。以前运行的证据未重新抓取时：claim 来源写 `freshness: "stale"`，保留原 evidence_ref 与原 fetched_at，不与本次证据包比对；只有 stale 来源的 claim 不能标 fact。没有任何来源的内容用 label `unverified`（未验证）并写 unverified_reason。`record` 对 0.1.6 新判断执行这些规则；本次证据包里被引用但缺 fetched_at/retrieved_at 的记录写入 validation_warnings。已登记的旧记录不重验、不改。快速核查同样适用，见 [factcheck.md](factcheck.md)。
+
 ## 已实现适配
 
 | kind | 用途/限制 |

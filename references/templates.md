@@ -56,7 +56,7 @@
   "report_path": "saved report path",
   "data_cutoff": "ISO time: latest fetched_at of any cited source; no data after this",
   "analysis_completed_at": "ISO time the judgment was finished; data_cutoff <= as_of <= analysis_completed_at",
-  "claims": [{"claim_id": "c1", "text": "one conclusion as written in the summary", "label": "fact|inference|self_reported|third_party_estimate|calculation|unknown",
+  "claims": [{"claim_id": "c1", "text": "one conclusion as written in the summary", "label": "fact|inference|self_reported|third_party_estimate|calculation|unknown|unverified",
               "sources": [{"evidence_ref": "existing ok evidence ID", "source_url": "https://full link",
                            "observed_at": "data's own time, or null + observed_at_unknown_reason",
                            "fetched_at": "must equal the evidence record retrieved_at when present",

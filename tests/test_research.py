@@ -571,3 +571,103 @@ class V015Tests(unittest.TestCase):
         bad["claims"][0]["sources"][0]["time_precision"] = "hour"
         with self.assertRaises(ValueError):
             record_decision(bad, evidence, self.root)
+
+
+class V016Tests(unittest.TestCase):
+    """0.1.6: quick fact-check mode; no training-memory facts (fetched_at / this-run evidence enforcement)."""
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def filled(self, **override):
+        from factcheck import skeleton
+        value = skeleton("Project X raised $10M led by Fund Y", "bot", "X 情报", "fc-test-1")
+        value.update(verdict="true", completed_at="2026-01-01T00:10:00Z", execution_agent="fixture", model="fixture-only",
+                     evidence=[{"evidence_id": "e1", "source_url": "https://example.com/pr", "source_type": "primary",
+                                "fetched_at": "2026-01-01T00:05:00Z", "data_time": None, "data_time_unknown_reason": "fixture",
+                                "freshness": "this_run", "note": "fixture"}],
+                     notes={"fact": [{"text": "fixture fact", "evidence_ids": ["e1"]}], "self_claim": [], "inference": [], "unknown": []})
+        value.update(override)
+        return value
+
+    def cli(self, *args, check=True):
+        import subprocess
+        script = Path(__file__).resolve().parents[1] / "scripts" / "research.py"
+        return subprocess.run([sys.executable, str(script), "factcheck", *args], capture_output=True, text=True, check=check)
+
+    def test_skeleton_has_no_signal_and_nulls(self):
+        out = json.loads(self.cli("new", "--claim", "Token Z lists on Binance", "--requested-by", "bot", "--id", "fc-a").stdout)
+        self.assertEqual(out["record_type"], "factcheck")
+        self.assertIsNone(out["verdict"])
+        self.assertNotIn("signal", out)
+        self.assertFalse((self.root / "factchecks").exists())
+
+    def test_validate_good_and_finalize_append_only(self):
+        from factcheck import finalize, validate
+        self.assertEqual(validate(self.filled())["errors"], [])
+        result = finalize(self.filled(), self.root)
+        self.assertEqual(result["verdict_zh"], "属实")
+        saved = json.loads(Path(result["factcheck_path"]).read_text())
+        self.assertEqual(saved["status"], "final")
+        self.assertNotIn("_template", saved)
+        with self.assertRaises(ValueError):
+            finalize(self.filled(), self.root)
+        with self.assertRaises(ValueError):
+            finalize(self.filled(factcheck_id="fc-test-2", supersedes="missing"), self.root)
+        finalize(self.filled(factcheck_id="fc-test-2", supersedes="fc-test-1", verdict="partly_true"), self.root)
+        self.assertFalse((self.root / "judgments.jsonl").exists())
+
+    def test_rejects_signals_missing_fetch_and_memory_facts(self):
+        from factcheck import validate
+        self.assertTrue(validate(self.filled(signal="BUY"))["errors"])
+        self.assertTrue(validate(self.filled(verdict="WATCH"))["errors"])
+        bad = self.filled(); del bad["evidence"][0]["fetched_at"]
+        self.assertTrue(any("fetched_at" in e for e in validate(bad)["errors"]))
+        bad = self.filled(); bad["evidence"][0]["fetched_at"] = "2026-01-01T00:05Z"
+        self.assertTrue(any("seconds" in e for e in validate(bad)["errors"]))
+        bad = self.filled(); bad["notes"]["fact"] = [{"text": "from memory"}]
+        self.assertTrue(validate(bad)["errors"])
+        stale = self.filled(); stale["evidence"][0]["freshness"] = "stale"
+        self.assertTrue(any("this run" in e for e in validate(stale)["errors"]))
+        ok = self.filled(verdict="unverifiable", evidence=[], notes={"fact": [], "self_claim": [], "inference": [], "unknown": ["no source"]})
+        self.assertEqual(validate(ok)["errors"], [])
+
+    def test_cli_validate_exit_code(self):
+        path = self.root / "fc.json"
+        path.write_text(json.dumps(self.filled(verdict=None)))
+        done = self.cli("validate", "--input", str(path), check=False)
+        self.assertEqual(done.returncode, 2)
+
+    def test_ledger_fact_requires_this_run_source_and_unverified_label(self):
+        evidence = {"records": [{"evidence_id": "p1", "status": "ok", "url": "https://example.com/price", "retrieved_at": "2025-12-31T23:55:00Z"}]}
+        bad = decision()
+        bad["claims"].append({"claim_id": "c2", "text": "memory", "label": "fact",
+                              "sources": [source(freshness="stale", evidence_ref="old-1", fetched_at="2025-11-01T00:00:00Z")]})
+        with self.assertRaises(ValueError):
+            record_decision(bad, evidence, self.root)
+        good = decision()
+        good["claims"].append({"claim_id": "c2", "text": "background", "label": "unverified", "unverified_reason": "model memory only"})
+        good["claims"].append({"claim_id": "c3", "text": "older", "label": "inference",
+                               "sources": [source(freshness="stale", evidence_ref="old-1", fetched_at="2025-11-01T00:00:00Z",
+                                                  observed_at=None, observed_at_unknown_reason="fixture")]})
+        row = record_decision(good, evidence, self.root)
+        self.assertNotIn("validation_warnings", row)
+        nounv = decision(); nounv["decision_id"] = "eth-x2"
+        nounv["claims"].append({"claim_id": "c2", "text": "bg", "label": "unverified"})
+        with self.assertRaises(ValueError):
+            record_decision(nounv, evidence, self.root)
+
+    def test_missing_pack_fetch_time_warns_and_old_records_still_audit(self):
+        row = record_decision(decision(), EVIDENCE, self.root)
+        self.assertTrue(row["validation_warnings"])
+        # Simulate a historical 0.1.5 ledger record: audit re-checks only the hash chain, not new 0.1.6 rules.
+        from ledger import append
+        old = copy.deepcopy(decision()); old.update(decision_id="old-015", record_type="decision", skill_version="0.1.5",
+                   due_at={"30": "2026-01-31T00:00:00Z", "90": "2026-04-01T00:00:00Z"})
+        old["claims"] = [{"claim_id": "c1", "text": "legacy", "label": "fact", "sources": [{"source_url": "https://example.com"}]}]
+        append(self.root, old)
+        self.assertEqual(audit(self.root)["status"], "ok")
+        self.assertIsInstance(due(self.root, "2026-06-01T00:00:00Z"), list)
