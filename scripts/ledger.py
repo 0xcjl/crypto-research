@@ -11,7 +11,7 @@ from common import VERSION, asset_key, digest, instant, now, number, safe_id
 from metrics import change
 
 SIGNALS = {"BUY", "SELL", "WATCH", "UNDETERMINED", "NOT_APPLICABLE"}
-CLAIM_LABELS = {"fact", "inference", "self_reported", "third_party_estimate", "calculation", "unknown"}
+CLAIM_LABELS = {"fact", "inference", "self_reported", "third_party_estimate", "calculation", "unknown", "unverified"}
 CLOCK_SKEW = timedelta(minutes=5)
 
 
@@ -164,12 +164,39 @@ def check_claims(value: dict, evidence: dict) -> datetime:
         ids.add(claim["claim_id"])
         if not claim.get("text") or claim.get("label") not in CLAIM_LABELS:
             raise ValueError(f"claim {claim['claim_id']}: text and label in {sorted(CLAIM_LABELS)} required")
+        if claim["label"] == "unverified" and not claim.get("sources"):
+            # 0.1.6: memory or un-refetched material may be stated only as 未验证, with a reason and no evidence.
+            if not claim.get("unverified_reason"):
+                raise ValueError(f"claim {claim['claim_id']}: unverified claim without sources needs unverified_reason")
+            continue
         if not claim.get("sources"):
             raise ValueError(f"claim {claim['claim_id']}: at least one source required")
+        fresh = 0
         for index, source in enumerate(claim["sources"]):
-            fetched = check_source(source, f"claim {claim['claim_id']} source {index}", evidence)
+            where = f"claim {claim['claim_id']} source {index}"
+            if source.get("freshness") == "stale":
+                # 0.1.6: earlier-run evidence keeps its original evidence_id and fetched_at; not matched to this pack.
+                if not source.get("evidence_ref"):
+                    raise ValueError(f"{where}: stale source must cite its original evidence_ref")
+                check_source(source, where, None)
+                continue
+            if source.get("freshness", "this_run") != "this_run":
+                raise ValueError(f"{where}: freshness must be this_run or stale")
+            fetched = check_source(source, where, evidence)
+            fresh += 1
             latest = fetched if latest is None or fetched > latest else latest
+        if claim["label"] == "fact" and not fresh:
+            raise ValueError(f"claim {claim['claim_id']}: fact needs a source fetched in this run; otherwise label unverified")
+    if latest is None:
+        raise ValueError("At least one claim must rest on evidence fetched in this run")
     return latest
+
+
+def freshness_warnings(value: dict, evidence: dict) -> list[str]:
+    """0.1.6: evidence records cited by claims should carry a request-time fetch stamp."""
+    cited = {s.get("evidence_ref") for c in value.get("claims", []) for s in c.get("sources", []) if s.get("freshness", "this_run") == "this_run"}
+    return [f"evidence {r['evidence_id']}: no fetched_at/retrieved_at in evidence pack"
+            for r in evidence.get("records", []) if r.get("evidence_id") in cited and not (r.get("fetched_at") or r.get("retrieved_at"))]
 
 
 def check_times(value: dict, latest_fetch: datetime, at: datetime):
@@ -260,6 +287,9 @@ def record_decision(document: dict, evidence: dict, runtime: Path) -> dict:
     assertion_ids = [item["id"] for item in value.get("assertions", [])]
     if len(assertion_ids) != len(set(assertion_ids)):
         raise ValueError("Assertion IDs must be unique")
+    warnings = freshness_warnings(value, evidence)
+    if warnings:
+        value["validation_warnings"] = warnings
     value.update(record_type="decision", skill_version=VERSION,
                  due_at={str(day): (at + timedelta(days=day)).isoformat().replace("+00:00", "Z") for day in (30, 90)})
     with locked(runtime):

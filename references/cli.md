@@ -13,7 +13,12 @@ python3 "$SKILL_ROOT/scripts/research.py" due --runtime "$RUNTIME"
 python3 "$SKILL_ROOT/scripts/research.py" review --runtime "$RUNTIME" --input review.json --evidence review-evidence.json
 python3 "$SKILL_ROOT/scripts/research.py" stats --runtime "$RUNTIME"
 python3 "$SKILL_ROOT/scripts/research.py" audit --runtime "$RUNTIME"
+python3 "$SKILL_ROOT/scripts/research.py" factcheck new --claim "说法原文" --requested-by bot --requester-name "X 情报" --output draft.json
+python3 "$SKILL_ROOT/scripts/research.py" factcheck validate --input draft.json
+python3 "$SKILL_ROOT/scripts/research.py" factcheck finalize --runtime "$RUNTIME" --input draft.json
 ```
+
+factcheck（0.1.6）：`new` 只打印/写出骨架（--output 不覆盖已有文件），不写 runtime；`validate` 输出 errors/warnings，有错误退出码2；`finalize` 校验后只追加写 RUNTIME/factchecks/<id>.json，id 已存在则拒绝，supersedes 必须指向已有核查。核查记录不得含 signal/due_at/reference_quote 等字段，不进 judgments.jsonl。见 [factcheck.md](factcheck.md)。
 
 无native结果时省略--native。每次批次使用新run-id；collection/evidence不覆盖。collect和prepare默认只打印索引/缺口/文件路径，不把全部响应反复塞给模型；模型按需读取所选证据及原文。确需全量输出可加--full。参数/数据出错退出码2；doctor网络不可用返回status=degraded、退出码3，不能把命令正常运行当成数据源可用。CLI记录账本时不替模型判断或调用模型API。
 
