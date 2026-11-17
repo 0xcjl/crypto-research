@@ -2,7 +2,7 @@
 
 用于调研 Crypto 项目、产品、协议和代币的可移植 Agent Skill。核心指令与报告以中文为主，可在 Codex、Hermes 及兼容的云端 Agent 中安装使用。
 
-当前版本：**0.1.6**。本仓库为私有仓库，未授予任何开源许可。
+当前版本：**0.1.7**。本项目以 [MIT License](LICENSE) 开源。
 
 ## 概览
 
@@ -68,7 +68,7 @@ $RUNTIME/                   # 位于 skill 目录之外，不提交到仓库
 
 ### 完整性校验
 
-`SHA256SUMS` 覆盖 SKILL.md、VERSION、CHANGELOG.md、agents、references 和 scripts、tests。`install.py` 安装前校验，要求清单含 `references/models.md` 与 `VERSION`，并拒绝含绕过审批/沙箱参数的 models.md；`doctor` 也做清单检查，失败即 degraded。
+`SHA256SUMS` 覆盖 SKILL.md、LICENSE、VERSION、CHANGELOG.md、agents、references 和 scripts、tests。`install.py` 安装前校验，要求清单含 `references/models.md`、`VERSION` 与 `LICENSE`，并拒绝含绕过审批/沙箱参数的 models.md；`doctor` 也做清单检查，失败即 degraded。
 
 ## 研究流程
 
@@ -157,7 +157,7 @@ gpt-6-astra 仅在用户点名时使用；不使用 Fast/Ultrafast 模式。每�
 
 ## 安装
 
-需要 Python 3.10+（仅标准库）。用有本私有仓库权限的 GitHub 账号克隆：
+需要 Python 3.10+（仅标准库）。克隆公开仓库：
 
 ```bash
 gh repo clone 0xcjl/crypto-research

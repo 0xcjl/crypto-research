@@ -7,7 +7,7 @@ import shutil
 from pathlib import Path, PurePosixPath
 
 
-REQUIRED_MEMBERS = ("SKILL.md", "scripts/research.py", "references/models.md", "VERSION")
+REQUIRED_MEMBERS = ("SKILL.md", "scripts/research.py", "references/models.md", "VERSION", "LICENSE")
 FORBIDDEN_FLAGS = ("--dangerously-bypass-approvals-and-sandbox",)
 
 

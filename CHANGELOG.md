@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.7
+
+- Release the skill under the MIT License and include the license in the integrity-checked install package.
+
 ## 0.1.6 — 2026-10-30
 - 快速核查模式（快速核查/factcheck）：新增 scripts/factcheck.py 与 `research.py factcheck new|validate|finalize`。verdict 为 true/partly_true/false/unverifiable（属实/部分属实/不实/无法核实）；证据逐条有 evidence_id、source_url、source_type（primary/secondary/self_claim）、fetched_at（UTC 秒）、data_time（未知为 null+理由）、freshness；notes 分 fact/self_claim/inference/unknown。拒绝 signal/due_at 等字段，不写判断账本、不排复盘；只追加到 RUNTIME/factchecks/<id>.json，更正用新 id + supersedes。新增 references/factcheck.md，SKILL.md 写明队友 bot 请求礼仪。
 - 硬规则“不用训练记忆当事实”：SKILL.md 与 data-contract.md 写明；ledger 新增 claim label `unverified`（无来源时需 unverified_reason）和来源 `freshness: stale`（引用原 evidence_ref/fetched_at，不与本次证据包比对）；只有 stale 来源的 fact claim、以及没有任何本次证据的判断被拒绝；被引用但缺 fetched_at/retrieved_at 的证据包记录写入 validation_warnings（警告，不阻断）。只对新登记记录执行，旧账本不重验。
